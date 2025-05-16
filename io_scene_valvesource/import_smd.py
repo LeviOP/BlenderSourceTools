@@ -607,43 +607,128 @@ class SmdImporter(bpy.types.Operator, Logger):
 		
 		print( "- Imported {} frames of animation".format(num_frames) )
 
-	def getMeshMaterial(self,mat_name):
+	def getMeshMaterial(self, tex_name):
 		smd = self.smd
+		mat_name = tex_name
 		if mat_name:
-			mat_name = self.truncate_id_name(mat_name, bpy.types.Material)
+			mat_name = self.truncate_id_name(tex_name, bpy.types.Material)
 		else:
 			mat_name = "Material"
 
 		md = smd.m.data
 		mat = None
-		for candidate in bpy.data.materials: # Do we have this material already?
-			if candidate.name == mat_name:
-				mat = candidate
-		if mat:
-			if md.materials.get(mat.name): # Look for it on this mesh
-				for i in range(len(md.materials)):
-					if md.materials[i].name == mat.name:
-						mat_ind = i
-						break
-			else: # material exists, but not on this mesh
-				md.materials.append(mat)
-				mat_ind = len(md.materials) - 1
-		else: # material does not exist
+		mat_ind = None
+
+		# First check if the material exists on this mesh
+		for i, existing_mat in enumerate(md.materials):
+			if existing_mat.name == mat_name:
+				mat = existing_mat
+				mat_ind = i
+				break
+
+		if mat is None:  # Material doesn't exist on this mesh, create a new one
 			print("- New material: {}".format(mat_name))
 			mat = bpy.data.materials.new(mat_name)
 			md.materials.append(mat)
-			# Give it a random colour
-			randCol = []
-			for i in range(3):
-				randCol.append(random.uniform(.4,1))
-			randCol.append(1)
-			mat.diffuse_color = randCol
+
+			# Set up material nodes
+			mat.use_nodes = True
+
+			# Try to load the texture
+			if self.qc:
+				texture_path = os.path.join(self.qc.root_filedir, tex_name)
+				if os.path.exists(texture_path):
+					try:
+						texture = bpy.data.images.load(texture_path, check_existing=True)
+						texture_node = mat.node_tree.nodes.new('ShaderNodeTexImage')
+						texture_node.image = texture
+						texture_node.location = (-280, 300)
+
+						bsdf = mat.node_tree.nodes.get('Principled BSDF')
+						if bsdf:
+							mat.node_tree.links.new(texture_node.outputs["Color"], bsdf.inputs["Base Color"])
+
+							# Get model name from root_filedir
+							model_name = os.path.basename(self.qc.root_filedir)
+
+							# Apply custom BSDF settings based on model and texture
+							self._apply_bsdf_settings(mat.node_tree, model_name, tex_name)
+					except Exception as e:
+						self.error(f"Failed to load texture {texture_path}: {e}")
+
 			if smd.jobType == PHYS:
 				smd.m.display_type = 'SOLID'
 			mat_ind = len(md.materials) - 1
 
 		return mat, mat_ind
-	
+
+	def _apply_bsdf_settings(self, tree: bpy.types.ShaderNodeTree, model_name, texture_name):
+		settings = {
+			"v_gauss": {
+				"spinnerBRIGHT.bmp": {
+					"bsdf": {
+						"Emission Strength": 3.0
+					}
+				},
+			},
+			"v_crossbow": {
+				"grip.bmp": {
+					"bsdf": {
+						"Roughness": 0.2,
+						"IOR": 1.5
+					}
+				},
+				"stock.bmp": {
+					"bsdf": {
+						"Roughness": 0.2,
+						"IOR": 1.5
+					}
+				}
+			}
+		}
+
+		bsdf = tree.nodes.get("Principled BSDF")
+
+		bsdf.inputs["Roughness"].default_value = 1.0
+		bsdf.inputs["IOR"].default_value = 1.0
+
+		# Apply model-specific settings
+		for model_key, model_settings in settings.items():
+			if model_key in model_name:
+				for texture_key, texture_settings in model_settings.items():
+					if texture_key in texture_name:
+						if texture_settings.get("bsdf"):
+							for param, value in texture_settings["bsdf"].items():
+								bsdf.inputs[param].default_value = value
+
+		if "v_gauss" in model_name and texture_name == "spinnerBRIGHT.bmp":
+			print("is there some reason this isn't working?")
+			image_texture = tree.nodes.get("Image Texture")
+			tree.links.new(image_texture.outputs["Color"], bsdf.inputs["Emission Color"])
+
+		if "chrome" in texture_name.lower():
+			print(f"model name: {texture_name}")
+			tex_coord = tree.nodes.new("ShaderNodeTexCoord")
+			tex_coord.location = (-820.0, 300.0)
+			vector_transform: bpy.types.ShaderNodeVectorTransform = tree.nodes.new("ShaderNodeVectorTransform")
+			vector_transform.location = (-640.0, 300.0)
+			vector_transform.convert_from = "WORLD"
+			vector_transform.convert_to = "CAMERA"
+			mapping: bpy.types.ShaderNodeMapping = tree.nodes.new("ShaderNodeMapping")
+			mapping.location = (-460.0, 300.0)
+			mapping.vector_type = "TEXTURE"
+			mapping.inputs["Location"].default_value[0] = 1
+			mapping.inputs["Location"].default_value[1] = 1
+			mapping.inputs["Scale"].default_value[0] = 2
+			mapping.inputs["Scale"].default_value[1] = 2
+			tree.links.new(tex_coord.outputs["Normal"], vector_transform.inputs["Vector"])
+			tree.links.new(vector_transform.outputs["Vector"], mapping.inputs["Vector"])
+			image_texture = tree.nodes.get("Image Texture")
+			tree.links.new(mapping.outputs["Vector"], image_texture.inputs["Vector"])
+
+			bsdf.inputs["Roughness"].default_value = 0.2
+			bsdf.inputs["IOR"].default_value = 1.5
+
 	# triangles block
 	def readPolys(self):
 		smd = self.smd
@@ -655,7 +740,7 @@ class SmdImporter(bpy.types.Operator, Logger):
 			mesh_name += " ref"
 		mesh_name = self.truncate_id_name(mesh_name, bpy.types.Mesh)
 
-		# Create a new mesh object, disable double-sided rendering, link it to the current scene
+		# Create a new mesh object, disable double-sided rendering, ink it to the current scene
 		smd.m = bpy.data.objects.new(mesh_name,bpy.data.meshes.new(mesh_name))
 		smd.m.parent = smd.a
 		smd.g.objects.link(smd.m)
@@ -687,6 +772,8 @@ class SmdImporter(bpy.types.Operator, Logger):
 		countPolys = 0
 		badWeights = 0
 		vertMap = {}
+		current_material = None
+		current_material_index = None
 
 		for line in smd.file:
 			line = line.rstrip("\n")
@@ -696,7 +783,11 @@ class SmdImporter(bpy.types.Operator, Logger):
 			if smdContinue(line):
 				continue
 
-			mat, mat_ind = self.getMeshMaterial(line if line else pgettext(get_id("importer_name_nomat", data=True)))
+			# Only get a new material if the material name has changed
+			if line != current_material:
+				current_material = line
+				mat, mat_ind = self.getMeshMaterial(line if line else pgettext(get_id("importer_name_nomat", data=True)))
+				current_material_index = mat_ind
 
 			# ***************************************************************
 			# Enter the vertex loop. This will run three times for each poly.
@@ -750,7 +841,7 @@ class SmdImporter(bpy.types.Operator, Logger):
 							bmVerts.append(bmv)
 
 						face = bm.faces.new(bmVerts)
-						face.material_index = mat_ind
+						face.material_index = current_material_index
 						for i in range(3):
 							face.loops[i][uvLayer].uv = faceUVs[i]
 
